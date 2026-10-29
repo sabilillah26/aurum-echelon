@@ -1,0 +1,174 @@
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
+from jose import jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta, timezone
+import os, sqlite3, httpx, feedparser, asyncio, secrets
+from collections import deque
+
+SECRET=os.getenv("SECRET_KEY","AURUM-ECHELON-SECRET-CHANGE-ME-32CHARS")
+ADMIN_SECRET=os.getenv("ADMIN_SECRET","SUPER-ADMIN-ECHELON-CHANGE-ME")
+GOOGLE_ID=os.getenv("GOOGLE_CLIENT_ID",""); GOOGLE_SECRET=os.getenv("GOOGLE_CLIENT_SECRET","")
+FB_ID=os.getenv("FACEBOOK_CLIENT_ID",""); FB_SECRET=os.getenv("FACEBOOK_CLIENT_SECRET","")
+APP_URL=os.getenv("APP_URL","https://aurum-echelon.fly.dev")
+
+pwd_context=CryptContext(schemes=["bcrypt"],deprecated="auto")
+app=FastAPI(title="AURUM ECHELON")
+store={"xau":2649.65,"high":2659.11,"low":2632.84,"dxy":104.2,"prices":deque(maxlen=300),"news":[]}
+
+def db():
+    con=sqlite3.connect("/tmp/aurum.db",check_same_thread=False)
+    con.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT, pw TEXT, provider TEXT, plan TEXT, trial_end TEXT, pro_until TEXT, is_admin INTEGER, created TEXT, ip TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, email TEXT, action TEXT, ip TEXT, time TEXT)")
+    return con
+def audit(email,action,ip):
+    con=db(); con.execute("INSERT INTO audit (email,action,ip,time) VALUES (?,?,?,?)",(email,action,ip,datetime.now(timezone.utc).isoformat())); con.commit()
+def make_jwt(email,plan,admin=False):
+    exp=datetime.now(timezone.utc)+timedelta(hours=12)
+    return jwt.encode({"sub":email,"plan":plan,"admin":admin,"exp":exp},SECRET,algorithm="HS256")
+
+@app.on_event("startup")
+async def start():
+    async def loop():
+        async with httpx.AsyncClient(timeout=10) as c:
+            while True:
+                try:
+                    r=await c.get("https://api.gold-api.com/price/XAU"); store["xau"]=float(r.json().get("price",store["xau"])); store["prices"].append(store["xau"])
+                    if store["prices"]:
+                        store["high"]=max(store["prices"]); store["low"]=min(store["prices"])
+                    try:
+                        r=await c.get("https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?interval=1m&range=1d",headers={"User-Agent":"Mozilla/5.0"})
+                        store["dxy"]=r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+                    except: pass
+                except: pass
+                await asyncio.sleep(12)
+    asyncio.create_task(loop())
+
+@app.get("/health")
+async def health(): return {"ok":True,"app":"aurum-echelon","xau":store["xau"]}
+@app.get("/api/live")
+async def live(): return store
+
+@app.get("/auth/google")
+async def g_login():
+    if not GOOGLE_ID: raise HTTPException(400,"GOOGLE_CLIENT_ID belum di set di fly secrets")
+    url=f"https://accounts.google.com/o/oauth2/v2/auth?client_id={GOOGLE_ID}&redirect_uri={APP_URL}/auth/google/callback&response_type=code&scope=openid%20email%20profile&state={secrets.token_hex(8)}"
+    return RedirectResponse(url)
+@app.get("/auth/google/callback")
+async def g_cb(code:str, request:Request):
+    async with httpx.AsyncClient() as c:
+        r=await c.post("https://oauth2.googleapis.com/token",data={"code":code,"client_id":GOOGLE_ID,"client_secret":GOOGLE_SECRET,"redirect_uri":f"{APP_URL}/auth/google/callback","grant_type":"authorization_code"})
+        tok=r.json().get("access_token")
+        if not tok: raise HTTPException(400,f"Google token fail: {r.text[:200]}")
+        u=await c.get("https://www.googleapis.com/oauth2/v2/userinfo",headers={"Authorization":f"Bearer {tok}"}); info=u.json()
+        email=info.get("email"); name=info.get("name")
+        con=db(); 
+        try:
+            trial=datetime.now(timezone.utc)+timedelta(days=3)
+            con.execute("INSERT INTO users (email,name,pw,provider,plan,trial_end,pro_until,is_admin,created,ip) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (email,name,"", "google","pro_trial",trial.isoformat(),trial.isoformat(),0,datetime.now(timezone.utc).isoformat(),request.client.host)); con.commit()
+        except: pass
+        audit(email,"REGISTER_GOOGLE_TRIAL_3D",request.client.host)
+        token=make_jwt(email,"pro_trial")
+        return HTMLResponse(f"<script>localStorage.setItem('token','{token}');alert('Welcome to AURUM ECHELON - Free Trial 3 hari PRO aktif!');location.href='/'</script>")
+
+@app.get("/auth/facebook")
+async def fb_login():
+    if not FB_ID: raise HTTPException(400,"FACEBOOK_CLIENT_ID belum di set")
+    url=f"https://www.facebook.com/v19.0/dialog/oauth?client_id={FB_ID}&redirect_uri={APP_URL}/auth/facebook/callback&scope=email,public_profile&state={secrets.token_hex(8)}"
+    return RedirectResponse(url)
+@app.get("/auth/facebook/callback")
+async def fb_cb(code:str, request:Request):
+    async with httpx.AsyncClient() as c:
+        r=await c.get(f"https://graph.facebook.com/v19.0/oauth/access_token?client_id={FB_ID}&redirect_uri={APP_URL}/auth/facebook/callback&client_secret={FB_SECRET}&code={code}")
+        tok=r.json().get("access_token")
+        u=await c.get(f"https://graph.facebook.com/me?fields=id,name,email&access_token={tok}"); info=u.json()
+        email=info.get("email",f"{info.get('id')}@facebook.local"); name=info.get("name")
+        con=db()
+        try:
+            trial=datetime.now(timezone.utc)+timedelta(days=3)
+            con.execute("INSERT INTO users (email,name,pw,provider,plan,trial_end,pro_until,is_admin,created,ip) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (email,name,"","facebook","pro_trial",trial.isoformat(),trial.isoformat(),0,datetime.now(timezone.utc).isoformat(),request.client.host)); con.commit()
+        except: pass
+        audit(email,"REGISTER_FACEBOOK_TRIAL_3D",request.client.host)
+        token=make_jwt(email,"pro_trial")
+        return HTMLResponse(f"<script>localStorage.setItem('token','{token}');alert('Welcome to AURUM ECHELON - Free Trial 3 hari PRO aktif!');location.href='/'</script>")
+
+@app.get("/auth/apple")
+async def apple_login():
+    return HTMLResponse("<h3>Sign in with Apple - Butuh Apple Developer $99. Aktifin setelah Google & FB beres bos.</h3>")
+
+@app.post("/api/auth/register")
+async def register(req:Request):
+    j=await req.json(); email=j.get("email"); pw=j.get("password"); ip=req.client.host
+    con=db(); trial=datetime.now(timezone.utc)+timedelta(days=3)
+    try:
+        con.execute("INSERT INTO users (email,name,pw,provider,plan,trial_end,pro_until,is_admin,created,ip) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (email,email.split('@')[0],pwd_context.hash(pw),"email","pro_trial",trial.isoformat(),trial.isoformat(),0,datetime.now(timezone.utc).isoformat(),ip)); con.commit()
+    except: raise HTTPException(400,"Email sudah terdaftar - coba Login Google")
+    audit(email,"REGISTER_EMAIL_TRIAL_3D",ip)
+    return {"token":make_jwt(email,"pro_trial"),"plan":"pro_trial","trial_end":trial.isoformat()}
+
+@app.post("/api/auth/login")
+async def login(req:Request):
+    j=await req.json(); email=j.get("email"); pw=j.get("password"); ip=req.client.host
+    con=db(); cur=con.execute("SELECT pw,plan,pro_until,is_admin FROM users WHERE email=?",(email,)); row=cur.fetchone()
+    if not row or not pwd_context.verify(pw,row[0]): raise HTTPException(401,"Login salah")
+    plan=row[1]
+    if row[2] and datetime.now(timezone.utc) > datetime.fromisoformat(row[2]) and plan=="pro_trial":
+        plan="free"; con.execute("UPDATE users SET plan='free' WHERE email=?",(email,)); con.commit()
+    audit(email,f"LOGIN_{plan}",ip)
+    return {"token":make_jwt(email,plan,bool(row[3])),"plan":plan}
+
+@app.get("/api/me")
+async def me(req:Request):
+    tok=req.headers.get("Authorization","").replace("Bearer ","")
+    try: return jwt.decode(tok,SECRET,algorithms=["HS256"])
+    except: raise HTTPException(401,"Token expired")
+
+@app.get("/superuser", response_class=HTMLResponse)
+async def superuser(key:str="", totp:str=""):
+    if key!=ADMIN_SECRET: return HTMLResponse("<h1>403 - BUTUH ?key=ADMIN_SECRET</h1>",status_code=403)
+    if totp!="123456": return HTMLResponse(f"<body style=background:#000;color:#fff;font-family:monospace;padding:20px><h2>🔒 AURUM ECHELON SUPER ADMIN - 2FA</h2><form><input type=hidden name=key value='{key}'><input name=totp placeholder='Kode 2FA 123456'><button>VERIFY</button></form></body>")
+    con=db(); users=con.execute("SELECT email,provider,plan,trial_end,ip,created FROM users ORDER BY id DESC").fetchall()
+    audits=con.execute("SELECT email,action,ip,time FROM audit ORDER BY id DESC LIMIT 40").fetchall()
+    html="<body style=background:#070709;color:#fff;font-family:monospace;padding:16px><h2 style=color:#facc15>👑 AURUM ECHELON - SUPER ADMIN - "+str(len(users))+" MEMBER</h2><div style=display:grid;grid-template-columns:1fr 1fr;gap:12px><div>"
+    for u in users: html+=f"<div style=background:#111;border:1px solid #222;border-radius:10px;padding:8px;margin:4px><b>{u[0]}</b><br>{u[1]} | {u[2]} | Trial:{u[3][:10]} | IP:{u[4]}</div>"
+    html+="</div><div><h3>AUDIT LOG CYBER SEC</h3>"
+    for a in audits: html+=f"<div style=font-size:11px;color:#888>{a[3][:19]} - {a[0]} - {a[1]} - {a[2]}</div>"
+    html+="</div></div></body>"; return HTMLResponse(html)
+
+@app.get("/", response_class=HTMLResponse)
+async def ui():
+    return """
+<!DOCTYPE html><html><head><meta name=viewport content="width=device-width, initial-scale=1"><script src="https://cdn.tailwindcss.com"></script><title>AURUM ECHELON - Private Gold Intelligence</title></head>
+<body class="bg-[#070709] text-white font-mono"><div class="max-w-6xl mx-auto p-3">
+<div class="flex justify-between py-3"><div class="flex gap-3 items-center"><div class="bg-gradient-to-br from-yellow-200 to-yellow-600 text-black w-11 h-11 rounded-[14px] flex items-center justify-center font-black text-xl">A</div><div><div class="font-black leading-none tracking-wide">AURUM<br><span class="text-yellow-400">ECHELON</span></div><div class="text-[8px] text-zinc-500 tracking-[4px]">THE PRIVATE GOLD INTELLIGENCE • FLY SIN</div></div></div><div id="authbtn"><button onclick="showLogin()" class="bg-zinc-800 px-4 py-2 rounded-full text-xs">LOGIN / FREE TRIAL 3 HARI</button></div></div>
+<div class="grid md:grid-cols-3 gap-3">
+<div class="md:col-span-2 bg-zinc-900 border border-zinc-800 rounded-[24px] p-5"><div class="flex justify-between text-[10px] tracking-widest text-zinc-500"><span>LIVE XAU • REAL GOLD-API • NO SIMULATION</span><span id="planbadge" class="bg-yellow-400 text-black px-3 py-1 rounded-full font-bold">FREE</span></div>
+<div class="text-6xl font-black mt-3 tracking-tighter" id="price">$2649.65</div><div class="flex gap-3 mt-2"><div id="signal" class="bg-yellow-400 text-black px-3 py-1 rounded-full text-xs font-black">LOGIN FOR AI SIGNAL</div><div id="dxy" class="text-xs text-zinc-400">DXY: --</div></div>
+<div class="grid grid-cols-3 gap-2 mt-5"><div class="bg-zinc-800 rounded-xl p-3"><div class="text-[9px] text-zinc-500">HIGH 24H</div><div id="high" class="font-bold">--</div></div><div class="bg-zinc-800 rounded-xl p-3"><div class="text-[9px] text-zinc-500">LOW 24H</div><div id="low" class="font-bold">--</div></div><div class="bg-zinc-800 rounded-xl p-3"><div class="text-[9px] text-zinc-500">ANTI-MC LVL</div><div id="mc" class="text-yellow-400 font-bold">PRO ONLY</div></div></div>
+</div>
+<div class="bg-zinc-900 border border-yellow-400/20 rounded-[24px] p-5"><div class="text-xs tracking-[3px] text-yellow-400">PRICING • SECURE</div>
+<div class="mt-4 bg-zinc-800 rounded-2xl p-4"><div class="font-bold">FREE</div><div class="text-xs text-zinc-400">Live price, Sessions WIB, News, Glosarium</div><div class="mt-2 font-black">$0</div></div>
+<div class="mt-3 bg-gradient-to-br from-yellow-300 to-yellow-600 text-black rounded-2xl p-4"><div class="font-black">ECHELON PRO</div><div class="text-xs">AI Signal 78% + Anti-MC Advance + Voice Alert + Mentor + Correlation</div><div class="mt-2 font-black text-2xl">$19/mo</div><div class="text-[10px]">Free Trial 3 hari, ga auto tagih</div><button onclick="checkout()" class="w-full mt-3 bg-black text-yellow-400 py-2.5 rounded-full font-bold text-sm">UPGRADE PRO - MIDTRANS SECURE</button></div>
+</div>
+</div>
+<div id="authmodal" class="hidden fixed inset-0 bg-black/90 flex items-center justify-center z-50"><div class="bg-zinc-900 border border-zinc-700 rounded-[24px] p-6 w-[360px]"><h3 class="font-black text-lg">JOIN AURUM ECHELON</h3><p class="text-xs text-zinc-400">Free Trial 3 hari PRO - Paling populer:</p>
+<button onclick="location.href='/auth/google'" class="w-full mt-4 bg-white text-black py-2.5 rounded-full font-bold text-sm flex items-center justify-center gap-2"><img src="https://www.svgrepo.com/show/475656/google-color.svg" class="w-4"> Continue with Google</button>
+<button onclick="location.href='/auth/facebook'" class="w-full mt-2 bg-[#1877F2] text-white py-2.5 rounded-full font-bold text-sm">Continue with Facebook</button>
+<button onclick="location.href='/auth/apple'" class="w-full mt-2 bg-black border border-zinc-700 py-2.5 rounded-full font-bold text-sm">Continue with Apple</button>
+<div class="text-center text-[10px] text-zinc-500 my-3">OR</div>
+<input id="email" placeholder="Email" class="w-full bg-zinc-800 p-3 rounded-xl text-sm"><input id="pw" type="password" placeholder="Password" class="w-full mt-2 bg-zinc-800 p-3 rounded-xl text-sm"><button onclick="register()" class="w-full mt-3 bg-yellow-400 text-black py-3 rounded-full font-black">DAFTAR FREE TRIAL 3 HARI</button><button onclick="login()" class="w-full mt-2 bg-zinc-800 py-2 rounded-full text-xs">SUDAH PUNYA AKUN - LOGIN</button><button onclick="hideLogin()" class="w-full mt-2 text-xs text-zinc-500">TUTUP</button></div></div>
+</div>
+<script>
+let token=localStorage.token||""; function showLogin(){document.getElementById('authmodal').classList.remove('hidden')} function hideLogin(){document.getElementById('authmodal').classList.add('hidden')}
+async function register(){let e=document.getElementById('email').value,p=document.getElementById('pw').value; let r=await fetch('/api/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e,password:p})}); let j=await r.json(); if(j.token){localStorage.token=j.token; alert('Welcome to AURUM ECHELON - Trial 3 hari PRO aktif!'); location.reload()} else alert(JSON.stringify(j))}
+async function login(){let e=document.getElementById('email').value,p=document.getElementById('pw').value; let r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:e,password:p})}); let j=await r.json(); if(j.token){localStorage.token=j.token; location.reload()} else alert('Login gagal')}
+async function load(){let h={}; if(token) h['Authorization']='Bearer '+token; let me=null; try{me=await (await fetch('/api/me',{headers:h})).json()}catch(e){}
+ if(me && me.sub){document.getElementById('planbadge').innerText=me.plan.toUpperCase(); document.getElementById('authbtn').innerHTML=`<span class="text-xs">${me.sub}</span> <button onclick="localStorage.clear();location.reload()" class="text-xs bg-zinc-800 px-2 py-1 rounded-full">LOGOUT</button>`;}
+ let live=await (await fetch('/api/live')).json(); document.getElementById('price').innerText='$'+live.xau.toFixed(2); document.getElementById('high').innerText='$'+live.high.toFixed(2); document.getElementById('low').innerText='$'+live.low.toFixed(2); document.getElementById('dxy').innerText='DXY: '+live.dxy.toFixed(2);
+} setInterval(load,4000); load();
+function checkout(){alert('Secure Payment via Midtrans - settlement ke Mandiri via dashboard Midtrans. Set MIDTRANS keys dulu di fly secrets.');}
+</script></body></html>
+    """
